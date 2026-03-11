@@ -4,7 +4,7 @@ Detects the card in a photograph taken on any background and extracts a
 clean, perspective-corrected crop suitable for grading analysis.
 """
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -20,12 +20,24 @@ class CardCropper:
 
     Parameters
     ----------
+    target_size : tuple of (width, height), optional
+        Default output resolution for cropped cards.  ``(750, 1050)`` by
+        default, matching a 2.5x3.5 inch card at 300 DPI.
+    padding : int
+        Extra pixels to include around the detected card edge.
     min_area_ratio : float
         Minimum fraction of the image area that the detected card must
-        occupy.  Contours smaller than this are rejected.  Default 0.15.
+        occupy.  Contours smaller than this are rejected.
     """
 
-    def __init__(self, min_area_ratio: float = 0.15):
+    def __init__(
+        self,
+        target_size: Tuple[int, int] = (750, 1050),
+        padding: int = 5,
+        min_area_ratio: float = 0.15,
+    ):
+        self.target_size = target_size
+        self.padding = padding
         self._min_area = min_area_ratio
 
     def crop(
@@ -41,8 +53,7 @@ class CardCropper:
         source : str, Path, or np.ndarray
             Input photograph.
         output_size : tuple of (width, height), optional
-            If given, the cropped card is resized to exactly this size.
-            A good default for high-res scans is ``(630, 880)``.
+            Override the default ``target_size`` for this call.
         max_dim : int
             Internal processing resolution.
 
@@ -57,6 +68,14 @@ class CardCropper:
             If no card-like quadrilateral is found.
         """
         original = load_image(source)
+        h, w = original.shape[:2]
+
+        # Reject images too small to contain a card
+        if h < 50 or w < 40:
+            raise RuntimeError(
+                "Image is too small to contain a trading card."
+            )
+
         img, scale = resize_for_processing(original, max_dim)
 
         quad = self._detect(img)
@@ -68,12 +87,14 @@ class CardCropper:
 
         # Map detected quad back to original resolution
         quad_orig = (quad / scale).astype(np.float32)
-        warped = self._warp(original, quad_orig, output_size)
+
+        size = output_size or self.target_size
+        warped = self._warp(original, quad_orig, size)
         return warped
 
     def crop_all(
         self, source, max_dim: int = 1500
-    ) -> list:
+    ) -> List[np.ndarray]:
         """Detect and crop *all* cards visible in the image.
 
         Returns a list of cropped card images sorted left-to-right.
@@ -85,10 +106,14 @@ class CardCropper:
         results = []
         for q in quads:
             q_orig = (q / scale).astype(np.float32)
-            results.append(self._warp(original, q_orig))
+            results.append(self._warp(original, q_orig, self.target_size))
 
-        # Sort left-to-right by centre x
-        results.sort(key=lambda c: c.shape[1])
+        # Sort left-to-right by the leftmost point of each quad
+        if len(quads) > 1:
+            paired = list(zip(quads, results))
+            paired.sort(key=lambda p: p[0][:, 0].min())
+            results = [r for _, r in paired]
+
         return results
 
     # ------------------------------------------------------------------
@@ -97,16 +122,17 @@ class CardCropper:
         candidates = self._detect_all(img)
         return candidates[0] if candidates else None
 
-    def _detect_all(self, img: np.ndarray) -> list:
+    def _detect_all(self, img: np.ndarray) -> List[np.ndarray]:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
 
-        # Try multiple edge-detection strategies
         results = []
         for low, high in [(30, 90), (50, 150), (20, 60)]:
             edges = cv2.Canny(blurred, low, high)
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+            edges = cv2.morphologyEx(
+                edges, cv2.MORPH_CLOSE, kernel, iterations=2
+            )
 
             contours, _ = cv2.findContours(
                 edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -120,7 +146,9 @@ class CardCropper:
                 peri = cv2.arcLength(cnt, True)
                 approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
                 if len(approx) == 4:
-                    results.append(approx.reshape(4, 2).astype(np.float32))
+                    results.append(
+                        approx.reshape(4, 2).astype(np.float32)
+                    )
 
             if results:
                 break
@@ -155,6 +183,9 @@ class CardCropper:
             # Ensure portrait
             if w > h:
                 w, h = h, w
+
+        w = max(w, 1)
+        h = max(h, 1)
 
         dst = np.array(
             [[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32
