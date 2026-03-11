@@ -16,26 +16,46 @@ from .utils import load_image, resize_for_processing
 
 @dataclass
 class Defect:
-    """A single detected surface defect."""
+    """A single detected surface defect.
 
-    kind: str  # "scratch", "print_line", "dent", "stain"
+    Parameters
+    ----------
+    kind : str
+        Type of defect: ``"scratch"``, ``"print_line"``, or ``"stain"``.
+    x, y : int
+        Top-left corner of the bounding box.
+    w, h : int
+        Width and height of the bounding box.
+    severity : float
+        Severity score from 0.0 (minor) to 1.0 (severe).
+    """
+
+    kind: str
     x: int
     y: int
-    width: int
-    height: int
-    severity: float  # 0.0 (minor) to 1.0 (severe)
+    w: int
+    h: int
+    severity: float
 
     @property
     def bbox(self) -> Tuple[int, int, int, int]:
-        return (self.x, self.y, self.width, self.height)
+        return (self.x, self.y, self.w, self.h)
 
 
 @dataclass
 class SurfaceReport:
-    """Aggregated surface analysis results."""
+    """Aggregated surface analysis results.
+
+    Parameters
+    ----------
+    defects : list of Defect
+        All detected defects.
+    overall_score : float
+        Surface quality from 0.0 (heavily damaged) to 1.0 (pristine).
+    """
 
     defects: List[Defect] = field(default_factory=list)
-    overall_score: float = 10.0  # 1-10 scale, 10 = perfect
+    overall_score: float = 1.0
 
     @property
     def scratch_count(self) -> int:
@@ -45,12 +65,16 @@ class SurfaceReport:
     def print_line_count(self) -> int:
         return sum(1 for d in self.defects if d.kind == "print_line")
 
+    @property
+    def stain_count(self) -> int:
+        return sum(1 for d in self.defects if d.kind == "stain")
+
     def summary(self) -> str:
         return (
-            f"Surface score: {self.overall_score:.1f}/10  |  "
+            f"Surface: {len(self.defects)} defects found  |  "
+            f"Score: {self.overall_score:.2f}  |  "
             f"Scratches: {self.scratch_count}  |  "
-            f"Print lines: {self.print_line_count}  |  "
-            f"Total defects: {len(self.defects)}"
+            f"Stains: {self.stain_count}"
         )
 
 
@@ -68,7 +92,12 @@ class SurfaceAnalyzer:
     """
 
     def __init__(self, sensitivity: float = 0.5):
-        self._sensitivity = np.clip(sensitivity, 0.0, 1.0)
+        self._sensitivity = float(np.clip(sensitivity, 0.0, 1.0))
+
+    @property
+    def sensitivity(self) -> float:
+        """Current detection sensitivity."""
+        return self._sensitivity
 
     def analyze(self, source, max_dim: int = 1200) -> SurfaceReport:
         """Run surface analysis on a card image.
@@ -83,10 +112,12 @@ class SurfaceAnalyzer:
         SurfaceReport
         """
         img = load_image(source)
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         img, _ = resize_for_processing(img, max_dim)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        defects = []
+        defects: List[Defect] = []
         defects.extend(self._detect_scratches(gray))
         defects.extend(self._detect_print_lines(gray))
         defects.extend(self._detect_stains(img, gray))
@@ -100,18 +131,21 @@ class SurfaceAnalyzer:
         Red regions indicate higher defect probability.
         """
         img = load_image(source)
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         img, _ = resize_for_processing(img, max_dim)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # High-pass filter to emphasise surface anomalies
         blur = cv2.GaussianBlur(gray, (21, 21), 0)
         high_pass = cv2.absdiff(gray, blur)
 
-        # Normalize and apply colour map
-        normalized = cv2.normalize(high_pass, None, 0, 255, cv2.NORM_MINMAX)
-        heatmap = cv2.applyColorMap(normalized.astype(np.uint8), cv2.COLORMAP_JET)
+        normalized = cv2.normalize(
+            high_pass, None, 0, 255, cv2.NORM_MINMAX
+        )
+        heatmap = cv2.applyColorMap(
+            normalized.astype(np.uint8), cv2.COLORMAP_JET
+        )
 
-        # Blend with original
         blended = cv2.addWeighted(img, 0.5, heatmap, 0.5, 0)
         return blended
 
@@ -122,9 +156,10 @@ class SurfaceAnalyzer:
         high_pass = cv2.absdiff(gray, blur)
 
         threshold = int(25 - self._sensitivity * 15)
-        _, binary = cv2.threshold(high_pass, threshold, 255, cv2.THRESH_BINARY)
+        _, binary = cv2.threshold(
+            high_pass, threshold, 255, cv2.THRESH_BINARY
+        )
 
-        # Morphology to connect linear features
         line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
         scratches_v = cv2.morphologyEx(binary, cv2.MORPH_OPEN, line_kernel)
 
@@ -137,9 +172,9 @@ class SurfaceAnalyzer:
             combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        defects = []
-        h, w = gray.shape
-        min_length = max(h, w) * 0.02
+        defects: List[Defect] = []
+        h, w_img = gray.shape
+        min_length = max(h, w_img) * 0.02
 
         for cnt in contours:
             x, y, cw, ch = cv2.boundingRect(cnt)
@@ -149,8 +184,8 @@ class SurfaceAnalyzer:
             aspect = max(cw, ch) / max(min(cw, ch), 1)
             if aspect < 3:
                 continue
-            severity = min(length / (max(h, w) * 0.15), 1.0)
-            defects.append(Defect("scratch", x, y, cw, ch, severity))
+            severity = min(length / (max(h, w_img) * 0.15), 1.0)
+            defects.append(Defect("scratch", x, y, cw, ch, round(severity, 2)))
 
         return defects
 
@@ -163,7 +198,7 @@ class SurfaceAnalyzer:
             maxLineGap=5,
         )
 
-        defects = []
+        defects: List[Defect] = []
         if lines is not None:
             for line in lines:
                 x1, y1, x2, y2 = line[0]
@@ -177,12 +212,18 @@ class SurfaceAnalyzer:
                 x = min(x1, x2)
                 y = min(y1, y2)
                 defects.append(
-                    Defect("print_line", x, y, abs(x2 - x1), abs(y2 - y1), severity)
+                    Defect(
+                        "print_line", x, y,
+                        abs(x2 - x1), abs(y2 - y1),
+                        round(severity, 2),
+                    )
                 )
 
-        return defects[:5]  # Cap at 5
+        return defects[:5]
 
-    def _detect_stains(self, img: np.ndarray, gray: np.ndarray) -> List[Defect]:
+    def _detect_stains(
+        self, img: np.ndarray, gray: np.ndarray
+    ) -> List[Defect]:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         _, s_channel, _ = cv2.split(hsv)
 
@@ -199,23 +240,27 @@ class SurfaceAnalyzer:
             binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        defects = []
-        h, w = gray.shape
-        min_area = h * w * 0.001
+        defects: List[Defect] = []
+        h, w_img = gray.shape
+        min_area = h * w_img * 0.001
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < min_area:
                 continue
             x, y, cw, ch = cv2.boundingRect(cnt)
-            severity = min(area / (h * w * 0.01), 1.0)
-            defects.append(Defect("stain", x, y, cw, ch, severity))
+            severity = min(area / (h * w_img * 0.01), 1.0)
+            defects.append(
+                Defect("stain", x, y, cw, ch, round(severity, 2))
+            )
 
         return defects[:10]
 
     @staticmethod
-    def _compute_score(defects: List[Defect], shape: Tuple[int, ...]) -> float:
+    def _compute_score(
+        defects: List[Defect], shape: Tuple[int, ...]
+    ) -> float:
         if not defects:
-            return 10.0
-        penalty = sum(d.severity * 1.5 for d in defects)
-        return max(round(10.0 - penalty, 1), 1.0)
+            return 1.0
+        penalty = sum(d.severity * 0.15 for d in defects)
+        return round(max(1.0 - penalty, 0.0), 2)
