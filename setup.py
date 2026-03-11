@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="tcgai-toolkit",
-    version="0.3.0",
+    version="0.4.0",
     author="TCG AI PRO",
     description="Python toolkit for TCG card image analysis",
     long_description=long_description,
