@@ -113,8 +113,11 @@ class TestCenteringAnalyzer(unittest.TestCase):
 
         result, overlay = self.analyzer.analyze_with_overlay(img)
         self.assertIsInstance(result, CenteringResult)
-        self.assertEqual(overlay.shape[:2], img.shape[:2])
+        # Overlay is a 3-channel image (may be warped to different size)
+        self.assertEqual(len(overlay.shape), 3)
         self.assertEqual(overlay.shape[2], 3)
+        self.assertGreater(overlay.shape[0], 0)
+        self.assertGreater(overlay.shape[1], 0)
 
     def test_gray_input(self):
         """Grayscale input should still work."""
