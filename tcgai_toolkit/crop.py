@@ -100,6 +100,12 @@ class CardCropper:
 
         quad_orig = (quad / scale).astype(np.float32)
 
+        # Expand the detected quad outward so the crop includes the
+        # full card border rather than cutting into it.  Edge
+        # detectors tend to land *on* the border pixels, which clips
+        # the outermost ring of the card.
+        quad_orig = self._expand_quad(quad_orig, h, w)
+
         size = output_size or self.target_size
         return self._warp(original, quad_orig, size)
 
@@ -111,12 +117,14 @@ class CardCropper:
         Returns a list of cropped card images sorted left-to-right.
         """
         original = load_image(source)
+        h_img, w_img = original.shape[:2]
         img, scale = resize_for_processing(original, max_dim)
 
         quads = self._detect_all(img)
         results: List[np.ndarray] = []
         for q in quads:
             q_orig = (q / scale).astype(np.float32)
+            q_orig = self._expand_quad(q_orig, h_img, w_img)
             results.append(self._warp(original, q_orig, self.target_size))
 
         if len(quads) > 1:
@@ -367,6 +375,29 @@ class CardCropper:
         rect[1] = pts[np.argmin(d)]
         rect[3] = pts[np.argmax(d)]
         return rect
+
+    def _expand_quad(
+        self,
+        quad: np.ndarray,
+        img_h: int,
+        img_w: int,
+        expand_pct: float = 0.03,
+    ) -> np.ndarray:
+        """Push each vertex outward from the centroid by *expand_pct*.
+
+        This compensates for edge detectors landing right *on* the card
+        boundary, which would clip the outermost border pixels.
+        The result is clamped to the image dimensions.
+        """
+        centroid = quad.mean(axis=0)
+        expanded = np.empty_like(quad)
+        for i in range(len(quad)):
+            direction = quad[i] - centroid
+            expanded[i] = quad[i] + direction * expand_pct
+        # Clamp to image bounds
+        expanded[:, 0] = np.clip(expanded[:, 0], 0, img_w - 1)
+        expanded[:, 1] = np.clip(expanded[:, 1], 0, img_h - 1)
+        return expanded.astype(np.float32)
 
     def _warp(
         self,
