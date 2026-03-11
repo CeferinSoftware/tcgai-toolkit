@@ -223,49 +223,142 @@ class CenteringAnalyzer:
 
     @staticmethod
     def _measure_borders_gradient(warped: np.ndarray) -> dict:
-        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        """Detect border widths using colour-distance scanning.
+
+        Samples the border colour from the very edge of the card and
+        then scans inward along each side until the colour diverges
+        significantly.  This works for both solid-colour borders
+        (Pokémon base-set yellow) and thin/dark borders (full-art, EX,
+        modern holographic) because it adapts to whatever colour is
+        actually present at the card edge.
+
+        Falls back to a variance-transition method when the primary
+        scan returns implausible values.
+        """
+        h, w = warped.shape[:2]
+        hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV).astype(np.float64)
+
+        # Maximum plausible border: 20 % of the smaller dim
+        max_border = int(min(h, w) * 0.20)
+        max_border = max(max_border, 10)
+
+        # Minimum border to report
+        min_border = max(int(min(h, w) * 0.005), 2)
+
+        # ----- helper: scan one edge ---------------------------------
+        def _scan_edge(strip: np.ndarray) -> int:
+            """*strip* is shaped (depth, length, 3) in HSV.
+            The first few rows represent the border colour.  Scan from
+            row 0 inward and return the depth where colour deviates.
+            """
+            depth, length = strip.shape[:2]
+            if depth < 4 or length < 4:
+                return min_border
+
+            # Centre 60 % of the strip to avoid corner artefacts
+            margin = int(length * 0.20)
+            centre = strip[:, margin:length - margin, :]
+            if centre.shape[1] < 4:
+                centre = strip
+
+            # Reference colour: median of the first 3 rows
+            ref = np.median(centre[:3, :, :], axis=(0, 1))  # (3,)
+
+            # Per-row mean colour
+            row_means = centre.mean(axis=1)  # (depth, 3)
+
+            # Colour distance from reference (weighted: H×2, S×1, V×1)
+            weights = np.array([2.0, 1.0, 1.0])
+            diffs = np.sqrt(((row_means - ref) ** 2 * weights).sum(axis=1))
+
+            # Find the first row where distance exceeds threshold
+            # Use adaptive threshold: 3× the noise in first 3 rows
+            noise = max(diffs[:3].std() * 3.0, 8.0)
+            threshold = max(noise, 12.0)
+
+            for i in range(min_border, min(depth, max_border)):
+                if diffs[i] > threshold:
+                    return i
+
+            # If we never exceeded the threshold, border is very thin
+            return min_border
+
+        # ----- build edge strips (depth × length × 3) ----------------
+        # Left: columns 0..max_border, full height → transpose so
+        #   depth = columns, length = rows
+        strip_left = hsv[:, :max_border, :].transpose(1, 0, 2)  # (cols, rows, 3)
+        strip_right = hsv[:, w - max_border:, :][:, ::-1, :].transpose(1, 0, 2)
+        strip_top = hsv[:max_border, :, :]          # (rows, cols, 3)
+        strip_bottom = hsv[h - max_border:, :, :][::-1, :, :]  # flipped
+
+        left = _scan_edge(strip_left)
+        right = _scan_edge(strip_right)
+        top = _scan_edge(strip_top)
+        bottom = _scan_edge(strip_bottom)
+
+        # ----- sanity: borders should be somewhat symmetric -----------
+        # If one axis is wildly asymmetric (>6:1 ratio), try the
+        # variance fallback for that axis.
+        lr_ok = (min(left, right) * 6 >= max(left, right))
+        tb_ok = (min(top, bottom) * 6 >= max(top, bottom))
+
+        if not lr_ok:
+            left_f, right_f = CenteringAnalyzer._variance_fallback_lr(warped)
+            if left_f > 0 and right_f > 0:
+                left, right = left_f, right_f
+        if not tb_ok:
+            top_f, bottom_f = CenteringAnalyzer._variance_fallback_tb(warped)
+            if top_f > 0 and bottom_f > 0:
+                top, bottom = top_f, bottom_f
+
+        return {"left": int(left), "right": int(right),
+                "top": int(top), "bottom": int(bottom)}
+
+    @staticmethod
+    def _variance_fallback_lr(warped: np.ndarray):
+        """Variance-based L/R border detection (fallback)."""
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float64)
         h, w = gray.shape
+        max_search = int(min(h, w) * 0.35)
+        min_b = max(int(min(h, w) * 0.005), 2)
+        v_margin = int(h * 0.10)
+        roi = gray[v_margin:h - v_margin, :]
+        col_var = roi.var(axis=0)
 
-        sobel_x = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
-        sobel_y = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+        def _find(profile):
+            kernel = np.ones(5) / 5
+            smooth = np.convolve(profile, kernel, mode="same")
+            base = np.median(smooth[:max(5, len(smooth) // 8)])
+            thr = max(base * 3.0, 30.0)
+            for i in range(min_b, min(len(smooth), max_search)):
+                if smooth[i] > thr:
+                    return i
+            return 0
 
-        margin = int(min(h, w) * 0.05)
-        search = int(min(h, w) * 0.25)
-        search = max(search, 1)
+        return _find(col_var), _find(col_var[::-1])
 
-        safe_m = min(margin, h // 3, w // 3)
+    @staticmethod
+    def _variance_fallback_tb(warped: np.ndarray):
+        """Variance-based T/B border detection (fallback)."""
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float64)
+        h, w = gray.shape
+        max_search = int(min(h, w) * 0.35)
+        min_b = max(int(min(h, w) * 0.005), 2)
+        h_margin = int(w * 0.10)
+        roi = gray[:, h_margin:w - h_margin]
+        row_var = roi.var(axis=1)
 
-        # Left border
-        col_energy = sobel_x[
-            safe_m : h - safe_m, safe_m : safe_m + search
-        ].mean(axis=0)
-        left = safe_m + int(np.argmax(col_energy)) if len(col_energy) else safe_m
+        def _find(profile):
+            kernel = np.ones(5) / 5
+            smooth = np.convolve(profile, kernel, mode="same")
+            base = np.median(smooth[:max(5, len(smooth) // 8)])
+            thr = max(base * 3.0, 30.0)
+            for i in range(min_b, min(len(smooth), max_search)):
+                if smooth[i] > thr:
+                    return i
+            return 0
 
-        # Right border
-        col_energy_r = sobel_x[
-            safe_m : h - safe_m, w - safe_m - search : w - safe_m
-        ].mean(axis=0)
-        right = (
-            search - int(np.argmax(col_energy_r[::-1]))
-            if len(col_energy_r) else safe_m
-        )
-
-        # Top border
-        row_energy = sobel_y[
-            safe_m : safe_m + search, safe_m : w - safe_m
-        ].mean(axis=1)
-        top = safe_m + int(np.argmax(row_energy)) if len(row_energy) else safe_m
-
-        # Bottom border
-        row_energy_b = sobel_y[
-            h - safe_m - search : h - safe_m, safe_m : w - safe_m
-        ].mean(axis=1)
-        bottom = (
-            search - int(np.argmax(row_energy_b[::-1]))
-            if len(row_energy_b) else safe_m
-        )
-
-        return {"left": left, "right": right, "top": top, "bottom": bottom}
+        return _find(row_var), _find(row_var[::-1])
 
     @staticmethod
     def _measure_borders_threshold(warped: np.ndarray) -> dict:
