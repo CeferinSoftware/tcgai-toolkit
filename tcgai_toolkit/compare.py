@@ -17,22 +17,38 @@ from .utils import load_image, resize_for_processing
 
 @dataclass
 class ComparisonResult:
-    """Result of comparing two card images."""
+    """Result of comparing two card images.
 
-    ssim: float  # Structural Similarity Index (0-1)
-    pixel_diff_pct: float  # Percentage of pixels that differ
-    match_score: float  # Overall match percentage (0-100)
+    Parameters
+    ----------
+    ssim : float
+        Structural Similarity Index from 0 (completely different) to
+        1 (identical).
+    pixel_diff_pct : float
+        Percentage of pixels that differ significantly.
+    match_score : float
+        Overall match percentage (0-100).
+    diff_region_count : int
+        Number of distinct regions that differ between the two images.
+    """
+
+    ssim: float
+    pixel_diff_pct: float
+    match_score: float
+    diff_region_count: int = 0
+
+    @property
+    def is_match(self) -> bool:
+        """Whether the two cards are likely the same."""
+        return self.ssim > 0.75
 
     def summary(self) -> str:
         return (
             f"Match: {self.match_score:.1f}%  |  "
             f"SSIM: {self.ssim:.4f}  |  "
-            f"Pixel diff: {self.pixel_diff_pct:.2f}%"
+            f"Pixel diff: {self.pixel_diff_pct:.2f}%  |  "
+            f"Diff regions: {self.diff_region_count}"
         )
-
-    @property
-    def is_likely_same_card(self) -> bool:
-        return self.ssim > 0.75
 
 
 class CardComparator:
@@ -77,15 +93,22 @@ class CardComparator:
         _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
         pixel_diff = np.count_nonzero(thresh) / thresh.size * 100
 
+        # Count distinct diff regions
+        contours, _ = cv2.findContours(
+            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        diff_region_count = len(contours)
+
         match_score = ssim_val * 60 + (100 - pixel_diff) * 0.4
 
         return ComparisonResult(
-            ssim=ssim_val,
+            ssim=round(ssim_val, 4),
             pixel_diff_pct=round(pixel_diff, 2),
             match_score=round(max(min(match_score, 100), 0), 1),
+            diff_region_count=diff_region_count,
         )
 
-    def diff_image(self, source_a, source_b) -> np.ndarray:
+    def visual_diff(self, source_a, source_b) -> np.ndarray:
         """Generate a visual diff between two card images.
 
         Returns a colour image where differences are highlighted in red.
@@ -99,13 +122,17 @@ class CardComparator:
         diff = cv2.absdiff(gray_a, gray_b)
         _, mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
 
-        # Create red overlay for differences
         overlay = img_a.copy()
         overlay[mask > 0] = [0, 0, 255]
 
         blended = cv2.addWeighted(img_a, 0.6, overlay, 0.4, 0)
         return blended
 
+    # Keep old name as alias for backward compatibility
+    diff_image = visual_diff
+
     def _prepare(self, source) -> np.ndarray:
         img = load_image(source)
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return cv2.resize(img, self._size, interpolation=cv2.INTER_AREA)
